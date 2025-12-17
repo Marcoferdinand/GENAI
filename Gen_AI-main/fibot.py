@@ -1,8 +1,9 @@
 import google.generativeai as genai
-
+from voice_agent import VoiceAgent # <--- Import class baru ini
 # KONFIGURASI GEMINI
-GEMINI_API_KEY = "AIzaSyAbtFNOmpTQ64Npc1w82mybOudP-4Ae7TU" # <--- Ganti dengan API Key dari Langkah 1
+GEMINI_API_KEY = "AIzaSyAqgUWYUWl7YcgrbPfVNr5-dO9x3U6maXA" # <--- Ganti dengan API Key dari Langkah 1
 genai.configure(api_key=GEMINI_API_KEY)
+voice_bot = VoiceAgent(GEMINI_API_KEY)
 import matplotlib
 matplotlib.use('Agg')   # non-interactive backend for server
 import matplotlib.pyplot as plt
@@ -464,117 +465,45 @@ def escape_markdown_v2(text: str) -> str:
 
 def generate_and_send_voice_analysis(update: Update, context: CallbackContext):
     """
-    1. Mengambil ringkasan data keuangan.
-    2. Minta Gemini buatkan naskah 'spoken word' yang santai.
-    3. Convert naskah jadi audio (gTTS).
-    4. Kirim Voice Note ke Telegram.
+    Versi Baru: Menggunakan VoiceAgent yang terpisah.
     """
     query = update.callback_query
     query.answer()
     
-    # Notifikasi 'Sedang merekam...'
-    query.edit_message_text("🎙️ Sedang menganalisis data & merekam suara AI... (Tunggu sebentar)")
+    # Notifikasi awal
+    query.edit_message_text("🎙️ Menghubungi Agen Suara AI... (Tunggu sebentar)")
     context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_audio")
 
-    # --- 1. AMBIL DATA KEUANGAN ---
     try:
-        conn = sqlite3.connect(get_db_name())
-        cursor = conn.cursor()
-        
-        # Ambil total income & expense bulan ini (mirip logika di graph)
-        now = datetime.now()
-        start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        
-        cursor.execute('''
-            SELECT r.amount, c.main_category, c.name 
-            FROM records r
-            JOIN categories c ON r.category_id = c.id
-            WHERE r.timestamp >= ?
-        ''', (start_date.strftime('%Y-%m-%d %H:%M:%S'),))
-        
-        data = cursor.fetchall()
-        conn.close()
+        # Panggil Agent untuk bekerja
+        db_path = get_db_name() # Mengambil nama DB bulan ini
+        voice_buf, script_text = voice_bot.create_voice_analysis(db_path)
 
-        income = sum(x[0] for x in data if x[1] == 'income')
-        expense = sum(x[0] for x in data if x[1] == 'expense')
-        balance = income - expense
-        
-        # Cari pengeluaran terbesar untuk bahan omongan
-        expenses_only = [x for x in data if x[1] == 'expense']
-        top_category = "belum ada"
-        if expenses_only:
-            from collections import Counter
-            # Hitung total per kategori
-            cat_totals = {}
-            for amt, _, name in expenses_only:
-                cat_totals[name] = cat_totals.get(name, 0) + amt
-            # Ambil yang paling boros
-            top_category = max(cat_totals, key=cat_totals.get)
+        if voice_buf:
+            # Hapus pesan loading
+            query.message.delete()
+            
+            # Kirim Voice Note
+            context.bot.send_voice(
+                chat_id=update.effective_chat.id, 
+                voice=voice_buf,
+                caption="🎙️ **Laporan Agen Keuangan**",
+                parse_mode='Markdown'
+            )
+            
+            # Tampilkan Transkrip & Menu
+            keyboard = [[InlineKeyboardButton("🔙 Menu Utama", callback_data='home')]]
+            context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"📝 *Transkrip:*\n_{script_text}_",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+        else:
+            query.edit_message_text(f"⚠️ Gagal: {script_text}") # script_text berisi error message jika gagal
 
     except Exception as e:
-        query.edit_message_text(f"❌ Gagal mengambil data: {e}")
-        return
-
-    # --- 2. GENERATE NASKAH DENGAN GEMINI ---
-    try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        
-        prompt = f"""
-        Buatkan naskah singkat (maksimal 400 karakter) untuk diucapkan oleh asisten keuangan pribadi.
-        Gaya bahasa: Santai, akrab, suportif, bahasa Indonesia gaul tapi sopan.
-        JANGAN gunakan simbol markdown (seperti bintang * atau pagar #) karena ini untuk suara.
-        
-        Data Keuangan User Bulan Ini:
-        - Pemasukan: Rp {income:,.0f}
-        - Pengeluaran: Rp {expense:,.0f}
-        - Sisa Uang: Rp {balance:,.0f}
-        - Kategori paling boros: {top_category}
-        
-        Struktur naskah:
-        1. Sapa user dengan ramah.
-        2. Bacakan kondisi keuangannya (sehat/kritis) berdasarkan sisa uang.
-        3. Sentil sedikit soal kategori paling boros (jika ada).
-        4. Tutup dengan semangat.
-        """
-        
-        response = model.generate_content(prompt)
-        script_text = response.text.replace("*", "").replace("#", "") # Bersihkan markdown
-        
-    except Exception as e:
-        script_text = "Halo! Maaf, sistem otak saya sedang gangguan, jadi belum bisa kasih analisis lengkap. Coba lagi nanti ya!"
-
-    # --- 3. CONVERT TEKS KE SUARA (TTS) ---
-    try:
-        # Menggunakan Bahasa Indonesia ('id')
-        tts = gTTS(text=script_text, lang='id', slow=False)
-        
-        voice_buf = BytesIO()
-        tts.write_to_fp(voice_buf)
-        voice_buf.seek(0)
-        
-        # --- 4. KIRIM KE TELEGRAM ---
-        # Hapus pesan loading sebelumnya
-        query.message.delete()
-        
-        # Kirim Voice Note
-        context.bot.send_voice(
-            chat_id=update.effective_chat.id, 
-            voice=voice_buf,
-            caption="🎙️ **Analisis Keuangan AI**",
-            parse_mode='Markdown'
-        )
-        
-        # Tampilkan Menu Kembali
-        keyboard = [[InlineKeyboardButton("🔙 Menu Utama", callback_data='home')]]
-        context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"📝 *Transkrip Singkat:*\n_{script_text}_",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
-        
-    except Exception as e:
-        context.bot.send_message(chat_id=update.effective_chat.id, text=f"⚠️ Gagal mengirim suara: {e}")
+        context.bot.send_message(chat_id=update.effective_chat.id, text=f"⚠️ Terjadi kesalahan bot: {e}")
 
 # Summarize current/expected balance based on income and expenses
 def summarize(update: Update, context: CallbackContext):
@@ -1194,50 +1123,77 @@ def show_investment_menu(update: Update, context: CallbackContext):
     else:
         update.message.reply_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
 
+def generate_stock_chart(ticker, title):
+    """
+    Fungsi untuk mengambil data saham/crypto dari Yahoo Finance
+    dan mengubahnya menjadi gambar grafik.
+    """
+    try:
+        # 1. Download data (period='6mo' artinya 6 bulan terakhir)
+        stock_data = yf.download(ticker, period='6mo', progress=False)
+        
+        if stock_data.empty:
+            print(f"Data kosong untuk {ticker}")
+            return None
+
+        # 2. Buat Plot Grafik
+        plt.figure(figsize=(10, 5))
+        # Menggunakan 'Close' price
+        plt.plot(stock_data.index, stock_data['Close'], label='Harga Penutup')
+        
+        plt.title(f'Grafik {title} (6 Bulan Terakhir)')
+        plt.xlabel('Tanggal')
+        plt.ylabel('Harga')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend()
+        
+        # 3. Simpan ke Memory Buffer (bukan file fisik)
+        buf = BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0) # Reset pointer ke awal file
+        plt.close() # Tutup plot agar hemat memori
+        
+        return buf
+
+    except Exception as e:
+        print(f"Gagal membuat chart {ticker}: {e}")
+        return None
 
 def handle_investment_selection(update: Update, context: CallbackContext):
     query = update.callback_query
     query.answer()
     
-    selection = query.data
+    # Ambil profil risiko dari callback_data (contoh: invest_low, invest_med, invest_high)
+    risk_code = query.data.split('_')[1]
     
-    # 1. Tentukan Aset apa yang mau ditampilkan grafiknya berdasarkan Profil
-    if selection == 'invest_low':
-        risk_profile = 'Konservatif'
-        # Konservatif biasanya Emas & Mata Uang
-        tickers_to_show = [
-            ('GC=F', 'Emas (Gold Futures)'), 
-            ('IDR=X', 'Nilai Tukar USD/IDR')
-        ]
-    elif selection == 'invest_mid':
-        risk_profile = 'Moderat'
-        # Moderat biasanya Saham Bluechip / Index Saham
-        tickers_to_show = [
-            ('^JKSE', 'IHSG (Indeks Saham Indonesia)'),
-            ('GC=F', 'Emas (Gold Futures)')
-        ]
-    else: # invest_high
-        risk_profile = 'Agresif'
-        # Agresif biasanya Crypto & Saham
-        tickers_to_show = [
-            ('BTC-USD', 'Bitcoin (BTC)'),
-            ('ETH-USD', 'Ethereum (ETH)')
-        ]
+    risk_map = {
+        'low': 'Konservatif (Cari Aman)',
+        'med': 'Moderat (Seimbang)',
+        'high': 'Agresif (Cuan Maksimal)'
+    }
+    risk_profile = risk_map.get(risk_code, 'Umum')
+
+    # Tentukan aset yang mau ditampilkan chart-nya berdasarkan profil risiko
+    if risk_code == 'low':
+        tickers_to_show = [('BBCA.JK', 'BCA (BBCA)'), ('GC=F', 'Emas (Gold)')]
+    elif risk_code == 'med':
+        tickers_to_show = [('TLKM.JK', 'Telkom (TLKM)'), ('^JKSE', 'IHSG')]
+    else: # high
+        tickers_to_show = [('BTC-USD', 'Bitcoin (BTC)'), ('ETH-USD', 'Ethereum (ETH)')]
 
     # Loading message
-    query.edit_message_text(f"⏳ Sedang menganalisis keuangan & mengambil data pasar live...", parse_mode='Markdown')
+    loading_msg = query.edit_message_text(f"⏳ Sedang menganalisis keuangan & mengambil data pasar live...", parse_mode=None)
     context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    # --- HITUNG CASHFLOW ---
+    # --- 1. HITUNG CASHFLOW ---
     conn = sqlite3.connect(get_db_name())
     cursor = conn.cursor()
     now = datetime.now()
     start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    
     cursor.execute('''
         SELECT r.amount, c.main_category 
-        FROM records r
-        JOIN categories c ON r.category_id = c.id
+        FROM records r 
+        JOIN categories c ON r.category_id = c.id 
         WHERE r.timestamp >= ?
     ''', (start_date.strftime('%Y-%m-%d %H:%M:%S'),))
     
@@ -1247,17 +1203,15 @@ def handle_investment_selection(update: Update, context: CallbackContext):
     income = sum(amt for amt, type in rows if type == 'income')
     expense = sum(amt for amt, type in rows if type == 'expense')
     surplus = income - expense
-    
-    # --- PANGGIL AI ---
-    # Kita paksa AI agar menyebutkan aset yang akan kita tampilkan grafiknya
-    # Supaya nyambung antara Teks AI dan Gambar Bot
+
+    # --- 2. PANGGIL AI (GEMINI) ---
     assets_str = ", ".join([t[1] for t in tickers_to_show])
     
     prompt = (
-        f"Bertindaklah sebagai Konsultan Keuangan Pribadi. \n"
-        f"User memiliki surplus: Rp {surplus:,.0f}. \n"
-        f"Profil Risiko: {risk_profile}. \n"
-        f"Saranmu HARUS menyinggung tentang potensi investasi di: {assets_str}.\n\n" # <--- KITA STIR AI-NYA
+        f"Bertindaklah sebagai Konsultan Keuangan Pribadi.\n"
+        f"User memiliki surplus: Rp {surplus:,.0f}.\n"
+        f"Profil Risiko: {risk_profile}.\n"
+        f"Saranmu HARUS menyinggung potensi investasi di: {assets_str}.\n\n"
         f"Berikan jawaban SINGKAT (maks 1500 karakter):\n"
         f"1. Strategi alokasi aset.\n"
         f"2. Kenapa memilih {assets_str}.\n"
@@ -1265,47 +1219,51 @@ def handle_investment_selection(update: Update, context: CallbackContext):
     )
 
     try:
-        model = genai.GenerativeModel("gemini-2.5-flash") # Gunakan gemini-pro agar lebih stabil
+        model = genai.GenerativeModel("gemini-2.5-flash") # Atau gemini-1.5-flash jika 2.5 belum jalan
         response = model.generate_content(prompt)
-        advice = response.text
+        msg_text = response.text
     except Exception as e:
-        advice = "Maaf, AI sedang error. Tapi berikut data pasar terbaru untukmu."
+        msg_text = f"Maaf, AI sedang gangguan: {e}. Tapi ini data pasarnya:"
 
-    # --- KIRIM HASIL ---
-    
-    # 1. Kirim Teks Analisis Dulu
-    msg_text = (
-        f"💰 **Analisis & Rekomendasi**\n"
-        f"Surplus: Rp {surplus:,.0f}\n"
-        f"Profil: {risk_profile}\n\n"
-        f"{advice}"
+    # --- 3. KIRIM PENJELASAN AI (DENGAN SAFEGUARD) ---
+    # Kita gunakan try-except khusus untuk send_message agar jika Markdown error, dia kirim polosan
+    try:
+        context.bot.send_message(
+            chat_id=update.effective_chat.id, 
+            text=msg_text, 
+            parse_mode='Markdown' # Mencoba pakai format Markdown dulu
+        )
+    except Exception as e:
+        # Jika gagal parsing (error yang kamu alami), kirim sebagai text biasa (tanpa format)
+        print(f"Markdown gagal, mengirim plain text. Error: {e}")
+        context.bot.send_message(
+            chat_id=update.effective_chat.id, 
+            text=msg_text, 
+            parse_mode=None 
+        )
+
+    # --- 4. KIRIM GAMBAR GRAFIK (INI YANG DITUNGGU) ---
+    for ticker, name in tickers_to_show:
+        try:
+            chart_buf = generate_stock_chart(ticker, name)
+            if chart_buf:
+                context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=chart_buf,
+                    caption=f"📊 Grafik {name} (6 Bulan Terakhir)"
+                )
+            else:
+                context.bot.send_message(chat_id=update.effective_chat.id, text=f"⚠️ Gagal memuat grafik {name}")
+        except Exception as e:
+            print(f"Error mengirim gambar {name}: {e}")
+
+    # Tampilkan menu kembali
+    keyboard = [[InlineKeyboardButton("🔙 Menu Utama", callback_data='home')]]
+    context.bot.send_message(
+        chat_id=update.effective_chat.id, 
+        text="Selesai. Ada lagi yang bisa dibantu?", 
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
-    
-    # Pecah pesan jika kepanjangan (Anti Error)
-    if len(msg_text) > 4000:
-        msg_text = msg_text[:4000] + "... (lanjutan terpotong)"
-
-    # Hapus loading, kirim pesan baru
-    query.message.delete()
-    context.bot.send_message(chat_id=update.effective_chat.id, text=msg_text, parse_mode='Markdown')
-
-    # 2. Kirim Grafik Live Market (Looping aset)
-    context.bot.send_message(chat_id=update.effective_chat.id, text=f"📈 **Live Market Data ({risk_profile})**\nMengambil data real-time...")
-    
-    for symbol, name in tickers_to_show:
-        chart_buf = get_market_chart(symbol, name)
-        if chart_buf:
-            context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=chart_buf,
-                caption=f"Harga terkini: {name}"
-            )
-        else:
-            context.bot.send_message(chat_id=update.effective_chat.id, text=f"⚠️ Gagal memuat grafik {name}")
-
-    # 3. Tombol Kembali
-    back_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu Utama", callback_data='start_over')]])
-    context.bot.send_message(chat_id=update.effective_chat.id, text="Selesai.", reply_markup=back_markup)# Function to show the menu with buttons
 
 def show_menu(update: Update, context: CallbackContext):
     keyboard = [
